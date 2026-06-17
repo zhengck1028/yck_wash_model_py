@@ -1,0 +1,8 @@
+# 统一换行符为 LF（Linux/NAS 部署一致性）
+* text=auto eol=lf
+*.py text eol=lf
+*.sql text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
