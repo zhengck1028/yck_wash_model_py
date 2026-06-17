@@ -75,16 +75,15 @@ services:
     restart: unless-stopped
 
   # 一次性初始化（建元数据库表 + 创建管理员账号），跑完即退出
+  # 用官方镜像内置的 _AIRFLOW_DB_MIGRATE + _AIRFLOW_WWW_USER_CREATE 机制，
+  # 不覆盖 entrypoint，避免容器内 uid 无 passwd 条目导致 getuser() 报错。
   airflow-init:
     <<: *airflow-common
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate
-        airflow users create \
-          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
-          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
-          --firstname admin --lastname admin --role Admin \
-          --email admin@example.com || true
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: "${_AIRFLOW_WWW_USER_USERNAME:-admin}"
+      _AIRFLOW_WWW_USER_PASSWORD: "${_AIRFLOW_WWW_USER_PASSWORD:-admin}"
+    command: version
     restart: "no"
