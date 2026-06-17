@@ -1,3 +1,6 @@
-pandas>=2.0.0
-pymysql>=1.1.0
-pypinyin>=0.49.0
+# ETL 业务依赖（锁定版本，与本地验证环境一致）
+pandas==3.0.3
+numpy==2.4.6
+PyMySQL==1.2.0
+pypinyin==0.55.0
+python-dotenv==1.2.2

@@ -31,6 +31,10 @@ preview_*.csv
 *.log
 logs/
 
+# ── Airflow 运行时（NAS 上生成，不入库）──
+airflow_logs/
+airflow_pgdata/
+
 # ── IDE / 编辑器 ──
 .vscode/
 .idea/

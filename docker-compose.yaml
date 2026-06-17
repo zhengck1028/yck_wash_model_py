@@ -1,0 +1,90 @@
+# Airflow on NAS（飞牛 fnOS）—— 精简版（LocalExecutor，无 Celery/Redis）
+# 适合任务少、几分钟跑完的场景，内存占用约 1-1.5GB。
+#
+# 部署见 DEPLOY_NAS.md。首次启动前需在同目录建 .env（数据库密码 + Airflow 配置）。
+
+x-airflow-common: &airflow-common
+  build: .
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # 业务代码加入 Python 搜索路径（卷挂载到 /opt/airflow/project）
+    PYTHONPATH: /opt/airflow/project:/opt/airflow/dags
+    # 时区
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Shanghai
+    TZ: Asia/Shanghai
+  volumes:
+    # DAG 目录
+    - ./dags:/opt/airflow/dags
+    # 业务代码（common / vdatabase_sync / autohome_match / else_sync 等）
+    - .:/opt/airflow/project
+    # 日志持久化
+    - ./airflow_logs:/opt/airflow/logs
+  # 业务 .env（数据库密码）注入容器
+  env_file:
+    - .env
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # Airflow 元数据库（与业务 MySQL 隔离）
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - ./airflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # 调度器（常驻，负责触发 DAG）
+  scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # Web UI（浏览器访问 NAS_IP:8080）
+  webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # 一次性初始化（建元数据库表 + 创建管理员账号），跑完即退出
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
+          --firstname admin --lastname admin --role Admin \
+          --email admin@example.com || true
+    restart: "no"
