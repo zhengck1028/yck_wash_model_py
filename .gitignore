@@ -1,0 +1,38 @@
+# ── 敏感信息（绝不提交）──
+.env
+.env.local
+*.pem
+*.key
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 虚拟环境 ──
+.venv/
+venv/
+env/
+
+# ── AWS / 部署 ──
+.aws-sam/
+
+# ── 数据迁移 / 临时产物 ──
+_migration/
+*.sql.bak
+*.csv
+preview_*.csv
+
+# ── 日志 ──
+*.log
+logs/
+
+# ── IDE / 编辑器 ──
+.vscode/
+.idea/
+*.swp
+.DS_Store
