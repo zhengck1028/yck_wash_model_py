@@ -11,6 +11,10 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # 单人小规模：webserver 只用 1 个 worker（默认 4 个，每个 ~500MB），省内存
+    AIRFLOW__WEBSERVER__WORKERS: "1"
+    # 长任务（pandas 大表处理）防被误判僵尸：心跳阈值放宽到 30 分钟
+    AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: "1800"
     # 业务代码加入 Python 搜索路径（卷挂载到 /opt/airflow/project）
     PYTHONPATH: /opt/airflow/project:/opt/airflow/dags
     # 时区
