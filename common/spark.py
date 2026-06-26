@@ -16,11 +16,18 @@
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 
 from pyspark.sql import DataFrame, SparkSession
 
 from common import config, db
+
+# Spark 的 Python worker 默认找系统 `python`，在 venv/无系统 python 的环境
+# 下会 "Python worker failed to connect back"。强制用当前解释器，driver 与
+# worker 用同一个 Python，避免回调失败。可被外部已设的环境变量覆盖。
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
 
 # ── SparkSession ───────────────────────────────────────────────────────
@@ -121,9 +128,14 @@ def _merge_columns(cols: list[str]) -> str:
     return ", ".join(f"`{c}`" for c in cols)
 
 
+def _is_empty(sdf: DataFrame) -> bool:
+    """判空，走 DataFrame API（避免 .rdd 在 Windows 触发 Python RDD 问题）。"""
+    return len(sdf.head(1)) == 0
+
+
 def write_replace(cfg: dict, table: str, sdf: DataFrame) -> None:
     """REPLACE 语义：临时表 + INSERT ... ON DUPLICATE KEY UPDATE 合并。"""
-    if sdf.rdd.isEmpty():
+    if _is_empty(sdf):
         return
     tmp, cols = _stage_to_tmp(cfg, table, sdf)
     try:
@@ -140,7 +152,7 @@ def write_replace(cfg: dict, table: str, sdf: DataFrame) -> None:
 
 def write_insert(cfg: dict, table: str, sdf: DataFrame) -> None:
     """INSERT IGNORE 语义：临时表 + INSERT IGNORE ... SELECT 合并。"""
-    if sdf.rdd.isEmpty():
+    if _is_empty(sdf):
         return
     tmp, cols = _stage_to_tmp(cfg, table, sdf)
     try:
