@@ -98,7 +98,24 @@ def _parse_ids(args) -> list[int]:
 
     if not ids:
         raise SystemExit("未提供任何 autohome_id，请用 --ids 或 --id-file 指定。")
-    return ids
+    return _exclude_manual(ids)
+
+
+def _exclude_manual(ids: list[int]) -> list[int]:
+    """剔除手动录入区间的 autohome_id（>阈值），避免自动数据覆盖手工维护内容。
+
+    手动录入的车型直接进 IT 生产库、不经爬虫/ODS，本工具一律拒绝重刷它们。
+    """
+    th = config.MANUAL_AUTOHOME_ID_THRESHOLD
+    manual = [i for i in ids if i > th]
+    if manual:
+        log.warning(
+            f"  拒绝 {len(manual)} 个手动录入 id（>{th}），不予重刷: {manual}"
+        )
+    kept = [i for i in ids if i <= th]
+    if not kept:
+        raise SystemExit(f"全部 id 都是手动录入区间（>{th}），无可重刷车型。")
+    return kept
 
 
 # ──────────────────────────────────────────────────────────────────────

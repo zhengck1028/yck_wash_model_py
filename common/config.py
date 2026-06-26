@@ -89,3 +89,8 @@ SMTP = {
     "from": _get("SMTP_FROM", "yckdc888@163.com"),
     "to": _get("SMTP_TO", "764703686@qq.com").split(","),
 }
+
+# ── 业务规则：手动录入车型阈值 ──────────────────────────────────────────
+# autohome_id 大于此值的车型为人工直接录入 IT 生产库的数据（不经爬虫/ODS）。
+# 自动同步链路必须排除这一区间，避免用自动数据覆盖手工维护的内容。
+MANUAL_AUTOHOME_ID_THRESHOLD = int(_get("MANUAL_AUTOHOME_ID_THRESHOLD", "1111111000"))
