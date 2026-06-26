@@ -283,7 +283,11 @@ def run() -> None:
             DB_ODS,
             "SELECT model_id autohome_id, model_price recommend_price FROM config_autohome_major_info_tmp WHERE is_check = 1",
         )
-        it_prices = db.query(DB_IT, "SELECT autohome_id, recommend_price FROM yck_car_basic_config")
+        # 防御性过滤：排除手动录入车型（>阈值），不参与自动价格比对/更新
+        it_prices = db.query(
+            DB_IT,
+            f"SELECT autohome_id, recommend_price FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
+        )
         price_diff = major_prices.merge(it_prices, on="autohome_id", suffixes=("_new", "_old"))
         price_diff = price_diff[
             pd.to_numeric(price_diff["recommend_price_new"], errors="coerce") !=
@@ -311,7 +315,11 @@ def run() -> None:
         ev_data[col] = ev_data[col].replace("", "-")
 
     # 通过 autohome_id 关联取得 IT 库主键 id（无对应 config 记录的 ev 数据丢弃）
-    basic_config = db.query(DB_IT, "SELECT id, autohome_id FROM yck_car_basic_config")
+    # 防御性过滤：排除手动录入车型（>阈值），其 ev 扩展由人工维护
+    basic_config = db.query(
+        DB_IT,
+        f"SELECT id, autohome_id FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
+    )
     basic_config["autohome_id"] = _id_str(basic_config["autohome_id"])
     ev_data["autohome_id"] = _id_str(ev_data["autohome_id"])
     ev_data = ev_data.merge(basic_config, on="autohome_id", how="inner")
