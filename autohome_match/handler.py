@@ -294,7 +294,11 @@ def _update_prices() -> None:
         DB_ODS,
         "SELECT model_id autohome_id, model_price recommend_price FROM config_autohome_major_info_tmp WHERE is_check = 1",
     )
-    it_prices = db.query(DB_IT, "SELECT autohome_id, recommend_price FROM yck_car_basic_config")
+    # 防御性过滤：排除手动录入车型（>阈值），不参与自动价格比对/更新
+    it_prices = db.query(
+        DB_IT,
+        f"SELECT autohome_id, recommend_price FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
+    )
     import pandas as pd
     diff = major_prices.merge(it_prices, on="autohome_id", suffixes=("_new", "_old"))
     diff = diff[
@@ -325,7 +329,11 @@ def _sync_ev() -> None:
             ev = ev.withColumn(c, F.when(F.col(c) == "", "-").otherwise(F.col(c)))
 
     # 关联 IT 主键 id
-    basic = read_sql(DB_IT, "SELECT id, autohome_id FROM yck_car_basic_config")
+    # 防御性过滤：排除手动录入车型（>阈值），其 ev 扩展由人工维护
+    basic = read_sql(
+        DB_IT,
+        f"SELECT id, autohome_id FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
+    )
     basic = basic.withColumn("autohome_id", F.col("autohome_id").cast("long"))
     ev = ev.withColumn("autohome_id", F.col("autohome_id").cast("long"))
     ev = ev.join(basic, on="autohome_id", how="inner")

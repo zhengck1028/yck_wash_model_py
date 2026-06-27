@@ -2,7 +2,7 @@
 
 敏感信息（密码）一律从环境变量 / .env 读取，**不在代码中硬编码**。
 本地开发：复制 .env.example 为 .env 并填入真实值。
-生产部署：用 AWS SSM Parameter Store 或容器环境变量注入。
+生产部署：用容器环境变量注入。
 
 非敏感的 host/port/库名保留默认值，方便快速本地运行。
 """
@@ -42,41 +42,41 @@ DB_LOCAL = {
 
 # ── 阿里云数据中台（已废弃，仅历史模块引用）────────────────────────────
 DB_YUN = {
-    "host": _get("DB_YUN_HOST", "47.106.189.86"),
+    "host": _get("DB_YUN_HOST", "localhost"),
     "port": int(_get("DB_YUN_PORT", "3306")),
-    "user": _get("DB_YUN_USER", "yckdc_dev"),
+    "user": _get("DB_YUN_USER", "root"),
     "password": _get("DB_YUN_PASS"),
-    "database": _get("DB_YUN_NAME", "yckdc_da2_ucar"),
+    "database": _get("DB_YUN_NAME", ""),
     "charset": "utf8",
 }
 
 # ── IT 云端生产库（最终写入目标）────────────────────────────────────────
 DB_IT = {
-    "host": _get("DB_IT_HOST", "47.107.191.81"),
+    "host": _get("DB_IT_HOST", "localhost"),
     "port": int(_get("DB_IT_PORT", "3306")),
     "user": _get("DB_IT_USER", "root"),
     "password": _get("DB_IT_PASS"),
-    "database": _get("DB_IT_NAME", "yck"),
+    "database": _get("DB_IT_NAME", ""),
     "charset": "utf8",
 }
 
 # ── IT 云端测试库 ──────────────────────────────────────────────────────
 DB_IT_TEST = {
-    "host": _get("DB_IT_TEST_HOST", "120.79.98.108"),
+    "host": _get("DB_IT_TEST_HOST", "localhost"),
     "port": int(_get("DB_IT_TEST_PORT", "3306")),
-    "user": _get("DB_IT_TEST_USER", "data"),
+    "user": _get("DB_IT_TEST_USER", "root"),
     "password": _get("DB_IT_TEST_PASS"),
-    "database": _get("DB_IT_TEST_NAME", "yck"),
+    "database": _get("DB_IT_TEST_NAME", ""),
     "charset": "utf8",
 }
 
 # ── 通用车型库（generalcardb）──────────────────────────────────────────
 DB_VDB = {
-    "host": _get("DB_VDB_HOST", "120.76.243.234"),
+    "host": _get("DB_VDB_HOST", "localhost"),
     "port": int(_get("DB_VDB_PORT", "3306")),
-    "user": _get("DB_VDB_USER", "cartypeupdate"),
+    "user": _get("DB_VDB_USER", "root"),
     "password": _get("DB_VDB_PASS"),
-    "database": _get("DB_VDB_NAME", "generalcardb"),
+    "database": _get("DB_VDB_NAME", ""),
     "charset": "utf8",
 }
 
@@ -84,8 +84,13 @@ DB_VDB = {
 SMTP = {
     "host": _get("SMTP_HOST", "smtp.163.com"),
     "port": int(_get("SMTP_PORT", "465")),
-    "user": _get("SMTP_USER", "yckdc888@163.com"),
+    "user": _get("SMTP_USER", ""),
     "password": _get("SMTP_PASS"),
-    "from": _get("SMTP_FROM", "yckdc888@163.com"),
-    "to": _get("SMTP_TO", "764703686@qq.com").split(","),
+    "from": _get("SMTP_FROM", ""),
+    "to": [x for x in _get("SMTP_TO", "").split(",") if x],
 }
+
+# ── 业务规则：手动录入车型阈值 ──────────────────────────────────────────
+# autohome_id 大于此值的车型为人工直接录入 IT 生产库的数据（不经爬虫/ODS）。
+# 自动同步链路必须排除这一区间，避免用自动数据覆盖手工维护的内容。
+MANUAL_AUTOHOME_ID_THRESHOLD = int(_get("MANUAL_AUTOHOME_ID_THRESHOLD", "1111111000"))

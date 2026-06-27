@@ -18,9 +18,6 @@ __pycache__/
 venv/
 env/
 
-# ── AWS / 部署 ──
-.aws-sam/
-
 # ── 数据迁移 / 临时产物 ──
 _migration/
 *.sql.bak
