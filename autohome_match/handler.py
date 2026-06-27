@@ -1,15 +1,29 @@
+"""车型库同步 ODS → IT 生产库（PySpark 实现）。
+
+  - 读取走 Spark JDBC（common.spark.read_sql）
+  - 中间计算用 Spark DataFrame API（join / 差集 / 正则清洗）
+  - 写回走 common.spark.write_replace / write_insert（临时表 + MERGE）
+
+ODS 内部 UPDATE（颜色回填）、指导价点更新这类「就地更新」仍走
+common.db 的 SQL（Spark 不适合做这种点更新）。
+
+环境要求见 common/spark.py。
+"""
 from __future__ import annotations
 
-import re
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
-import pandas as pd
-
-from common import config, db, notifier
+from common import config, db
 from common.logging_setup import get_logger
+from common.spark import get_spark, read_sql, write_insert, write_replace
 
 log = get_logger("autohome_match")
 
-# 排放标准规范化映射（顺序敏感，长串先匹配）
+DB_ODS = config.DB_ODS
+DB_IT = config.DB_IT
+
+# 排放标准规范化映射（顺序敏感，与 pandas 版 _EMISSION_MAP 一致）
 _EMISSION_MAP = [
     (r"\+OBD|\)", ""),
     (r"3|III|Ⅲ", "三"),
@@ -46,6 +60,7 @@ _CONFIG_COLS = [
     "seat_material", "electric_seat_memory",
 ]
 
+# yck2 列重命名（与 pandas 版 YCK2_RENAME 一致，按位置对齐）
 YCK2_RENAME = [
     "autohome_id", "emission", "level", "engine", "gear_box", "length", "width", "height",
     "body_structure", "seat_number", "wheelbase", "weight", "trunk_volume", "intake",
@@ -68,83 +83,79 @@ YCK2_RENAME = [
     "color_outside", "color_outside_code", "hl_configs", "hl_configc",
 ]
 
-DB_ODS = config.DB_ODS
-DB_IT = config.DB_IT
 
+# ── 清洗工具（Spark Column 表达式，对齐 pandas 版）──────────────────────
 
-def _normalize_emission(s: str) -> str:
+def _normalize_emission_col(col: F.Column) -> F.Column:
+    """对应 pandas _normalize_emission：顺序敏感的链式替换。"""
+    c = col.cast("string")
     for pattern, repl in _EMISSION_MAP:
-        s = re.sub(pattern, repl, s)
-    return s
+        c = F.regexp_replace(c, pattern, repl)
+    return c
 
 
-def _split_pair(df: pd.DataFrame, front_cols: list, rear_cols: list) -> pd.DataFrame:
-    for fc, rc in zip(front_cols, rear_cols):
-        if fc in df.columns:
-            df[fc] = df[fc].astype(str).str.replace(r"\?\\/.*|\\/.*", "", regex=True)
-        if rc in df.columns:
-            df[rc] = df[rc].astype(str).str.replace(r".*\\/\\?|.*\\/", "", regex=True)
-    return df
+def _split_pair(sdf: DataFrame) -> DataFrame:
+    """对应 pandas _split_pair：前字段去 /后部分，后字段去 前/部分。"""
+    for fc, rc in zip(_FRONT_COLS, _REAR_COLS):
+        if fc in sdf.columns:
+            sdf = sdf.withColumn(fc, F.regexp_replace(F.col(fc).cast("string"), r"\?\\/.*|\\/.*", ""))
+        if rc in sdf.columns:
+            sdf = sdf.withColumn(rc, F.regexp_replace(F.col(rc).cast("string"), r".*\\/\\?|.*\\/", ""))
+    return sdf
 
 
-def _normalize_config_flag(df: pd.DataFrame) -> pd.DataFrame:
-    for col in [c for c in _CONFIG_COLS if c in df.columns]:
-        df[col] = df[col].astype(str)
-        df[col] = df[col].str.replace(r"前标配|后标配|主标配|副标配|标配", "Y", regex=True)
-        df[col] = df[col].str.replace(r"前选配|后选配|主选配|副选配|选配", "-", regex=True)
-        df[col] = df[col].str.replace(r"前无|后无|主无|副无|无", "N", regex=True)
-        df[col] = df[col].str.replace(r"前-|后-|主-|副-|-", "N", regex=True)
-    return df
+def _normalize_config_flag(sdf: DataFrame) -> DataFrame:
+    """对应 pandas _normalize_config_flag：标配→Y / 选配→- / 无/-→N。"""
+    for col in [c for c in _CONFIG_COLS if c in sdf.columns]:
+        c = F.col(col).cast("string")
+        c = F.regexp_replace(c, r"前标配|后标配|主标配|副标配|标配", "Y")
+        c = F.regexp_replace(c, r"前选配|后选配|主选配|副选配|选配", "-")
+        c = F.regexp_replace(c, r"前无|后无|主无|副无|无", "N")
+        c = F.regexp_replace(c, r"前-|后-|主-|副-|-", "N")
+        sdf = sdf.withColumn(col, c)
+    return sdf
 
 
-def _id_str(series: pd.Series) -> pd.Series:
-    """把 ID 列转成干净整数字符串 Series（保留原索引，NaN→''）。
-
-    DB 取回的整数列若含 NULL，pandas 会整列转 float64，astype(str) 产生
-    '12345.0' 这种带 .0 的脏值，导致与纯整数 ID 的差集判断全部漏匹配。
-    这里统一转 numeric → Int64（可空整数）→ str，NaN 变成空串不会误匹配。
-    """
-    nums = pd.to_numeric(series, errors="coerce").astype("Int64")
-    return nums.astype(str).replace("<NA>", "")
+def _id_norm(col: F.Column) -> F.Column:
+    """规范化 ID 为干净整数字符串（对应 pandas _id_str/_id_set）。"""
+    return F.col(col).cast("long").cast("string") if isinstance(col, str) else col
 
 
-def _id_set(series: pd.Series) -> set[str]:
-    """规范化 ID 列为干净整数字符串集合（丢弃 NaN）。"""
-    nums = pd.to_numeric(series, errors="coerce").dropna()
-    return set(nums.astype("int64").astype(str))
+# ── 各步骤 ─────────────────────────────────────────────────────────────
 
-
-def run() -> None:
-    # ── 品牌同步 ──────────────────────────────────────────────────────────
+def _sync_brand() -> None:
+    """[1/7] 品牌同步。"""
     log.info("[1/7] 品牌同步...")
-    yck_brand = db.query(DB_ODS, "SELECT * FROM config_autohome_yck_brand")
-    if not yck_brand.empty:
-        it_brand_ids = db.query(DB_IT, "SELECT brandid FROM yck_car_basic_brand")
-        existing = set(it_brand_ids["brandid"].astype(str))
-        yck_brand = yck_brand[~yck_brand["brandid"].astype(str).isin(existing)]
-    if not yck_brand.empty:
-        db.bulk_upsert(DB_IT, "yck_car_basic_brand", yck_brand)
-        log.info(f"  → 新增品牌 {len(yck_brand)} 条")
+    yck = read_sql(DB_ODS, "SELECT * FROM config_autohome_yck_brand")
+    it = read_sql(DB_IT, "SELECT brandid FROM yck_car_basic_brand")
+    new = yck.join(it, on="brandid", how="left_anti")
+    n = new.count()
+    if n:
+        write_replace(DB_IT, "yck_car_basic_brand", new)
+        log.info(f"  → 新增品牌 {n} 条")
     else:
         log.info("  → 无新品牌")
 
-    # ── 车系同步 ──────────────────────────────────────────────────────────
+
+def _sync_series() -> None:
+    """[2/7] 车系同步。"""
     log.info("[2/7] 车系同步...")
-    yck_series = db.query(
+    yck = read_sql(
         DB_ODS,
         "SELECT series_id, series_group_name, series_name, brandid, brand_name, car_level, is_import FROM config_autohome_yck_series",
     )
-    if not yck_series.empty:
-        it_series_ids = db.query(DB_IT, "SELECT series_id FROM yck_car_basic_series")
-        existing_s = set(it_series_ids["series_id"].astype(str))
-        yck_series = yck_series[~yck_series["series_id"].astype(str).isin(existing_s)]
-    if not yck_series.empty:
-        db.bulk_upsert(DB_IT, "yck_car_basic_series", yck_series)
-        log.info(f"  → 新增车系 {len(yck_series)} 条")
+    it = read_sql(DB_IT, "SELECT series_id FROM yck_car_basic_series")
+    new = yck.join(it, on="series_id", how="left_anti")
+    n = new.count()
+    if n:
+        write_replace(DB_IT, "yck_car_basic_series", new)
+        log.info(f"  → 新增车系 {n} 条")
     else:
         log.info("  → 无新车系")
 
-    # ── 颜色回填（DB_ODS 内部） ───────────────────────────────────────────
+
+def _backfill_color() -> None:
+    """[3/7] 颜色回填（ODS 内部就地 UPDATE，走 SQL）。"""
     log.info("[3/7] 颜色回填（ODS 内部）...")
     n = db.execute(
         DB_ODS,
@@ -158,39 +169,45 @@ def run() -> None:
     )
     log.info(f"  → 更新 {n} 条颜色记录")
 
-    # ── 拉取新车型基础信息（yck1）────────────────────────────────────────
+
+def _sync_config() -> None:
+    """[4-6/7] 车型宽表合并（yck1+yck2）并写入 IT。"""
+    # ── yck1：基础信息 ──
     log.info("[4/7] 拉取 ODS 主表 + DB_IT 已有 ID...")
-    major = db.query(
+    major = read_sql(
         DB_ODS,
         "SELECT model_id, brandid, series_id, status, model_name, model_price, model_year, is_green FROM config_autohome_major_info_tmp WHERE is_check = 1",
     )
-    log.info(f"  ODS major: {len(major)} 条")
-    brand_it = db.query(DB_IT, "SELECT brandid, Initial, brand_name FROM yck_car_basic_brand")
-    series_it = db.query(DB_IT, "SELECT series_id, series_name, series_group_name FROM yck_car_basic_series")
-    config_it_ids = db.query(DB_IT, "SELECT autohome_id FROM yck_car_basic_config")
+    brand_it = read_sql(DB_IT, "SELECT brandid, Initial, brand_name FROM yck_car_basic_brand")
+    series_it = read_sql(DB_IT, "SELECT series_id, series_name, series_group_name FROM yck_car_basic_series")
+    cfg_ids = read_sql(DB_IT, "SELECT autohome_id FROM yck_car_basic_config").withColumn(
+        "autohome_id", F.col("autohome_id").cast("long")
+    )
 
-    existing_cfg = _id_set(config_it_ids["autohome_id"])
-    log.info(f"  IT 库已有车型 autohome_id: {len(existing_cfg)} 个")
-    major = major[~_id_str(major["model_id"]).isin(existing_cfg)]
-    log.info(f"  过滤已存在后剩余: {len(major)} 条")
+    # 差集：过滤掉 IT 已有的（model_id 对 autohome_id）
+    major = major.withColumn("model_id", F.col("model_id").cast("long"))
+    major = major.join(
+        cfg_ids.withColumnRenamed("autohome_id", "model_id"), on="model_id", how="left_anti"
+    )
 
     yck1 = (
-        major
-        .merge(brand_it, on="brandid", how="inner")
-        .merge(series_it, on="series_id", how="inner")
+        major.join(brand_it, on="brandid", how="inner")
+        .join(series_it, on="series_id", how="inner")
+        .withColumnRenamed("model_id", "autohome_id")
+        .withColumnRenamed("brand_name", "brand")
+        .withColumnRenamed("series_name", "series")
+        .withColumnRenamed("Initial", "mark")
+        .withColumnRenamed("series_group_name", "factory_name")
+        .withColumnRenamed("status", "is_selling")
+        .withColumnRenamed("model_price", "recommend_price")
+        .withColumnRenamed("model_year", "year")
     )
-    log.info(f"  merge 品牌+车系后: {len(yck1)} 条")
-    yck1 = yck1.rename(columns={
-        "model_id": "autohome_id", "brand_name": "brand", "series_name": "series",
-        "Initial": "mark", "series_group_name": "factory_name",
-        "status": "is_selling", "model_price": "recommend_price", "model_year": "year",
-    })
-    yck1["type_name"] = (yck1["series"] + " " + yck1["model_name"]).str.strip()
-    yck1["produced_place"] = ""
+    yck1 = yck1.withColumn("type_name", F.trim(F.concat_ws(" ", F.col("series"), F.col("model_name"))))
+    yck1 = yck1.withColumn("produced_place", F.lit(""))
 
-    # ── 拉取详细配置（yck2）──────────────────────────────────────────────
+    # ── yck2：详细配置 ──
     log.info("[5/7] 拉取详细配置（yck2）...")
-    yck2 = db.query(
+    yck2 = read_sql(
         DB_ODS,
         """SELECT a.*, '' hl_configs, '' hl_configc, c.car_level
            FROM config_autohome_detail_info a
@@ -198,142 +215,150 @@ def run() -> None:
            LEFT JOIN config_autohome_yck_series c ON b.series_id = c.series_id
            WHERE b.is_check = 1""",
     )
-    log.info(f"  yck2 原始: {len(yck2)} 条, {len(yck2.columns)} 列")
-    yck2 = yck2[~_id_str(yck2["autohome_id"]).isin(existing_cfg)]
-    log.info(f"  过滤已存在后: {len(yck2)} 条")
+    yck2 = yck2.withColumn("autohome_id", F.col("autohome_id").cast("long"))
+    yck2 = yck2.join(
+        cfg_ids.withColumnRenamed("autohome_id", "autohome_id"), on="autohome_id", how="left_anti"
+    )
 
-    # car_level 来自 yck_series（SQL 末列），不在 YCK2_RENAME 中，先拆出来
-    car_level_series = yck2["car_level"] if "car_level" in yck2.columns else None
+    # car_level 单独留存，drop 掉 url/update_time/car_level 后按位置重命名
+    has_car_level = "car_level" in yck2.columns
+    if has_car_level:
+        car_level_df = yck2.select("autohome_id", "car_level")
     drop_cols = [c for c in ("url", "update_time", "car_level") if c in yck2.columns]
-    yck2 = yck2.drop(columns=drop_cols)
+    yck2 = yck2.drop(*drop_cols)
 
-    log.info(f"  drop 后列数: {len(yck2.columns)}, YCK2_RENAME 期望: {len(YCK2_RENAME)}")
     if len(yck2.columns) == len(YCK2_RENAME):
-        yck2.columns = YCK2_RENAME
+        yck2 = yck2.toDF(*YCK2_RENAME)
     else:
-        log.warning(f"  WARNING: 列数不匹配，实际列: {list(yck2.columns)}")
-    # level 用 car_level 覆盖（车型等级）
-    if car_level_series is not None:
-        yck2["level"] = car_level_series.values
+        log.warning(f"  WARNING: 列数不匹配 {len(yck2.columns)} vs {len(YCK2_RENAME)}: {yck2.columns}")
 
+    # level 用 car_level 覆盖
+    if has_car_level:
+        yck2 = yck2.drop("level").join(
+            car_level_df.withColumnRenamed("car_level", "level"), on="autohome_id", how="left"
+        )
+
+    # emission 取空格前第一段
     if "emission" in yck2.columns:
-        yck2["emission"] = yck2["emission"].astype(str).str.split(" ").str[0]
+        yck2 = yck2.withColumn("emission", F.split(F.col("emission").cast("string"), " ").getItem(0))
 
-    yck2 = _split_pair(yck2, _FRONT_COLS, _REAR_COLS)
+    yck2 = _split_pair(yck2)
     yck2 = _normalize_config_flag(yck2)
 
-    # ── 合并 yck1 + yck2 ─────────────────────────────────────────────────
+    # ── 合并 yck1 + yck2 ──
     log.info("[6/7] 合并 yck1 + yck2，写入 DB_IT...")
-    yck1["autohome_id"] = yck1["autohome_id"].astype(int)
-    yck2["autohome_id"] = yck2["autohome_id"].astype(int)
-    yck = yck1.merge(yck2, on="autohome_id", how="inner")
-    log.info(f"  合并后: {len(yck)} 条, {len(yck.columns)} 列")
+    yck = yck1.join(yck2, on="autohome_id", how="inner")
 
-    if yck.empty:
-        log.info("  → 无新车型需要同步。")
-    else:
-        yck = yck.fillna("-")
-        for col in ["color_outside", "color_outside_code"]:
-            if col in yck.columns:
-                yck[col] = yck[col].str.replace("无", "", regex=False)
-                yck[col] = yck[col].str.rstrip(";")
+    # 颜色清洗
+    for col in ("color_outside", "color_outside_code"):
+        if col in yck.columns:
+            c = F.regexp_replace(F.col(col).cast("string"), "无", "")
+            c = F.regexp_replace(c, ";+$", "")  # rstrip(';')
+            yck = yck.withColumn(col, c)
+    # 排放标准中文化
+    if "environmental_standards_org" in yck.columns:
+        yck = yck.withColumn("environmental_standards", _normalize_emission_col(F.col("environmental_standards_org")))
+    # type_name 多空格归一
+    if "type_name" in yck.columns:
+        yck = yck.withColumn("type_name", F.trim(F.regexp_replace(F.col("type_name"), r" +", " ")))
 
-        if "environmental_standards_org" in yck.columns:
-            yck["environmental_standards"] = (
-                yck["environmental_standards_org"].astype(str).apply(_normalize_emission)
-            )
+    # DataFrame 内去重（同 autohome_id 取首行）
+    from pyspark.sql import Window
+    w = Window.partitionBy("autohome_id").orderBy(F.lit(1))
+    yck = yck.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
 
-        if "type_name" in yck.columns:
-            yck["type_name"] = yck["type_name"].str.replace(r" +", " ", regex=True).str.strip()
+    # 二次差集：再查一次 IT 已有 autohome_id
+    existing_now = read_sql(DB_IT, "SELECT autohome_id FROM yck_car_basic_config").withColumn(
+        "autohome_id", F.col("autohome_id").cast("long")
+    )
+    yck = yck.join(existing_now, on="autohome_id", how="left_anti")
 
-        # ── 增量去重（不依赖 ODS 基准表，以 DB_IT 为唯一基准）────────────────
-        # 1) DataFrame 内部去重：yck1×yck2 merge 后同一 autohome_id 可能多行
-        before = len(yck)
-        yck = yck.drop_duplicates(subset=["autohome_id"], keep="first")
-        if len(yck) < before:
-            log.info(f"  DataFrame 内去重: {before} → {len(yck)} 条")
+    if len(yck.head(1)) == 0:
+        log.info("  → 去重后无新车型，跳过写入。")
+        return
 
-        # 2) 写入前再查一次 IT 库已有 autohome_id（防拉取期间的竞态/重复跑）
-        existing_now = _id_set(
-            db.query(DB_IT, "SELECT autohome_id FROM yck_car_basic_config")["autohome_id"]
+    # 只保留目标表真实存在的列（id 由 AUTO_INCREMENT，不写）
+    target_cols = db.query(DB_IT, "DESCRIBE yck_car_basic_config")["Field"].tolist()
+    keep_cols = [c for c in target_cols if c != "id" and c in yck.columns]
+    # 缺失列补 "-"（fillna 等价：写入前对 keep_cols 填充）
+    yck = yck.select(*keep_cols).fillna("-")
+    n = yck.count()
+    write_insert(DB_IT, "yck_car_basic_config", yck)
+    log.info(f"  → 写入 {n} 条车型记录")
+
+
+def _update_prices() -> None:
+    """[6/7 尾] 指导价增量更新（点更新走 SQL bulk_update）。"""
+    log.info("  指导价差异比对...")
+    major_prices = db.query(
+        DB_ODS,
+        "SELECT model_id autohome_id, model_price recommend_price FROM config_autohome_major_info_tmp WHERE is_check = 1",
+    )
+    # 防御性过滤：排除手动录入车型（>阈值），不参与自动价格比对/更新
+    it_prices = db.query(
+        DB_IT,
+        f"SELECT autohome_id, recommend_price FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
+    )
+    import pandas as pd
+    diff = major_prices.merge(it_prices, on="autohome_id", suffixes=("_new", "_old"))
+    diff = diff[
+        pd.to_numeric(diff["recommend_price_new"], errors="coerce")
+        != pd.to_numeric(diff["recommend_price_old"], errors="coerce")
+    ]
+    log.info(f"  → 指导价变更 {len(diff)} 条")
+    if not diff.empty:
+        params = [(r["recommend_price_new"], int(r["autohome_id"])) for _, r in diff.iterrows()]
+        db.bulk_update(
+            DB_IT, "UPDATE yck_car_basic_config SET recommend_price=%s WHERE autohome_id=%s", params
         )
-        before = len(yck)
-        yck = yck[~_id_str(yck["autohome_id"]).isin(existing_now)]
-        if len(yck) < before:
-            log.info(f"  二次差集过滤: {before} → {len(yck)} 条")
 
-        if yck.empty:
-            log.info("  → 去重后无新车型，跳过写入。")
-        else:
-            # 只保留 DB_IT 目标表真实存在的列，id 不传由 AUTO_INCREMENT 分配
-            target_cols = db.query(DB_IT, "DESCRIBE yck_car_basic_config")["Field"].tolist()
-            keep_cols = [c for c in target_cols if c != "id" and c in yck.columns]
-            missing = [c for c in target_cols if c != "id" and c not in yck.columns]
-            if missing:
-                log.warning(f"  注意: 目标表有但 yck 缺失的列(将不写入): {missing}")
-            yck = yck[keep_cols]
-            log.info(f"  写入列数: {len(keep_cols)}")
 
-            db.bulk_insert(DB_IT, "yck_car_basic_config", yck)
-            log.info(f"  → 写入 {len(yck)} 条车型记录")
-
-        # ── 指导价增量更新 ────────────────────────────────────────────────
-        log.info("  指导价差异比对...")
-        major_prices = db.query(
-            DB_ODS,
-            "SELECT model_id autohome_id, model_price recommend_price FROM config_autohome_major_info_tmp WHERE is_check = 1",
-        )
-        # 防御性过滤：排除手动录入车型（>阈值），不参与自动价格比对/更新
-        it_prices = db.query(
-            DB_IT,
-            f"SELECT autohome_id, recommend_price FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
-        )
-        price_diff = major_prices.merge(it_prices, on="autohome_id", suffixes=("_new", "_old"))
-        price_diff = price_diff[
-            pd.to_numeric(price_diff["recommend_price_new"], errors="coerce") !=
-            pd.to_numeric(price_diff["recommend_price_old"], errors="coerce")
-        ]
-        log.info(f"  → 指导价变更 {len(price_diff)} 条")
-        if not price_diff.empty:
-            params = [
-                (row["recommend_price_new"], int(row["autohome_id"]))
-                for _, row in price_diff.iterrows()
-            ]
-            db.bulk_update(
-                DB_IT,
-                "UPDATE yck_car_basic_config SET recommend_price=%s WHERE autohome_id=%s",
-                params,
-            )
-
-    # ── 新能源扩展表增量更新（每次都跑）──────────────────────────────────
+def _sync_ev() -> None:
+    """[7/7] 新能源扩展表增量更新（按 IT 主键 id 用 REPLACE 语义覆盖）。"""
     log.info("[7/7] 新能源扩展表增量更新...")
-    ev_data = db.query(DB_ODS, "SELECT * FROM config_autohome_ev_info")
-    ev_data = ev_data.rename(columns={"model_id": "autohome_id", "ee_fast_charge": "ee_fast_charge(%)"})
-    ev_data = ev_data.drop(columns=["add_time", "update_time"], errors="ignore")
-    ev_data["ee_fast_charge(%)"] = ev_data["ee_fast_charge(%)"].astype(str).str.replace(r"^%", "-", regex=True)
-    for col in ev_data.columns[1:]:
-        ev_data[col] = ev_data[col].replace("", "-")
+    ev = read_sql(DB_ODS, "SELECT * FROM config_autohome_ev_info")
+    ev = ev.withColumnRenamed("model_id", "autohome_id").withColumnRenamed("ee_fast_charge", "ee_fast_charge(%)")
+    for c in ("add_time", "update_time"):
+        if c in ev.columns:
+            ev = ev.drop(c)
+    # ee_fast_charge(%)：开头 % 替成 -
+    ev = ev.withColumn("ee_fast_charge(%)", F.regexp_replace(F.col("ee_fast_charge(%)").cast("string"), r"^%", "-"))
+    # 空串 → -（除 autohome_id 外）
+    for c in ev.columns:
+        if c != "autohome_id":
+            ev = ev.withColumn(c, F.when(F.col(c) == "", "-").otherwise(F.col(c)))
 
-    # 通过 autohome_id 关联取得 IT 库主键 id（无对应 config 记录的 ev 数据丢弃）
+    # 关联 IT 主键 id
     # 防御性过滤：排除手动录入车型（>阈值），其 ev 扩展由人工维护
-    basic_config = db.query(
+    basic = read_sql(
         DB_IT,
         f"SELECT id, autohome_id FROM yck_car_basic_config WHERE autohome_id <= {config.MANUAL_AUTOHOME_ID_THRESHOLD}",
     )
-    basic_config["autohome_id"] = _id_str(basic_config["autohome_id"])
-    ev_data["autohome_id"] = _id_str(ev_data["autohome_id"])
-    ev_data = ev_data.merge(basic_config, on="autohome_id", how="inner")
-    ev_data = ev_data[["id"] + [c for c in ev_data.columns if c not in ("id", "autohome_id")]]
+    basic = basic.withColumn("autohome_id", F.col("autohome_id").cast("long"))
+    ev = ev.withColumn("autohome_id", F.col("autohome_id").cast("long"))
+    ev = ev.join(basic, on="autohome_id", how="inner")
+    # 排列为 id 在首、去掉 autohome_id
+    cols = ["id"] + [c for c in ev.columns if c not in ("id", "autohome_id")]
+    ev = ev.select(*cols)
 
-    if ev_data.empty:
+    if len(ev.head(1)) == 0:
         log.info("  → 无可关联的新能源记录，跳过。")
-    else:
-        # REPLACE INTO 按主键 id 增量：新增则插入，已存在则覆盖（参数更新）
-        db.bulk_upsert(DB_IT, "yck_car_basic_config_ev", ev_data)
-        log.info(f"  → 新能源记录增量写入 {len(ev_data)} 条")
+        return
+    write_replace(DB_IT, "yck_car_basic_config_ev", ev)
+    log.info("  → 新能源记录增量写入完成")
 
-    notifier.send_mail("同步到IT系统的车型库", "同步完成")
-    log.info("[autohome_match] 完成。")
+
+def run() -> None:
+    get_spark()  # 触发 SparkSession 初始化
+    _sync_brand()
+    _sync_series()
+    _backfill_color()
+    _sync_config()
+    _update_prices()
+    _sync_ev()
+    from common import notifier
+    notifier.send_mail("同步到IT系统的车型库", "同步完成（Spark）")
+    log.info("[autohome_match·spark] 完成。")
 
 
 if __name__ == "__main__":

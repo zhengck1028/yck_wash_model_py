@@ -1,5 +1,5 @@
 """
-其它数据同步（对应 fun_else_sync.R）
+其它数据同步（PySpark 实现）
 
 各部分触发时间：
   - 投诉数据          每月 1 日
@@ -10,20 +10,23 @@
   - 车主裸车价（汽车之家）  每周四
   - 车主裸车价（易车）     每月 24 日
 
-Lambda event 格式：
-  {}                   → 按当天日期自动判断执行哪些任务
-  {"task": "complaint"}  → 强制执行指定任务（便于手动补跑）
+入口 run(task=None)：
+  None     → 按当天日期自动判断执行哪些任务
+  "xxx"    → 强制执行指定任务（便于手动补跑）
 
-可用 task 值：complaint / discount / salesnum / koubei / dealer / owner_price_ah / owner_price_yiche
+读取走 Spark JDBC，写回走临时表 MERGE（common.spark.write_replace）。
+城市标准化等带正则的清洗用 Spark Column 表达式实现。
 """
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
-import pandas as pd
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
 
 from common import config, db, notifier
+from common.spark import get_spark, read_sql, write_replace
 
 DB_LOCAL = config.DB_LOCAL
 DB_YUN = config.DB_YUN
@@ -33,36 +36,16 @@ _DAY = _TODAY.day
 _MONTH_START = _TODAY.strftime("%Y-%m-01")
 
 
-def _extract_city(s: pd.Series, config_distr: pd.DataFrame, config_distr_all: pd.DataFrame) -> pd.Series:
-    """城市标准化（同 wash_platform base.py 逻辑）"""
-    cities = config_distr["city"].tolist()
-    pat = "|".join(re.escape(c) for c in cities)
-    counties = config_distr_all["key_county"].tolist()
-    county_pat = "|".join(re.escape(c) for c in counties)
-    county_map = config_distr_all.drop_duplicates("key_county").set_index("key_county")["city"]
+# ── 城市标准化 ─────────────────────────────────────────────────────────
 
-    def _match(val):
-        if pd.isna(val):
-            return None
-        m = re.search(pat, str(val))
-        if m:
-            return m.group(0)
-        m2 = re.search(county_pat, str(val))
-        if m2:
-            return county_map.get(m2.group(0))
-        return None
-
-    return s.apply(_match)
-
-
-def _load_distr():
-    distr = db.query(
+def _load_distr() -> tuple[DataFrame, DataFrame]:
+    distr = read_sql(
         DB_YUN,
         """SELECT DISTINCT regional, b.province, a.key_municipal city
            FROM config_district a
            INNER JOIN config_district_regional b ON a.key_province = b.province""",
     )
-    distr_all = db.query(
+    distr_all = read_sql(
         DB_YUN,
         """SELECT DISTINCT regional, b.province, a.key_municipal city, a.key_county
            FROM config_district a
@@ -71,11 +54,45 @@ def _load_distr():
     return distr, distr_all
 
 
+def _city_extract_expr(col: F.Column, cities: list[str]) -> F.Column:
+    """从文本中提取首个命中的城市名（对应 pandas re.search(城市pattern)）。"""
+    pat = "|".join(re.escape(c) for c in cities)
+    # regexp_extract 取第一个匹配；无匹配返回 ""，转 None
+    ext = F.regexp_extract(col.cast("string"), f"({pat})", 1)
+    return F.when(ext == "", None).otherwise(ext)
+
+
+def _add_city_clean(sdf: DataFrame, src_col: str, distr: DataFrame, distr_all: DataFrame) -> DataFrame:
+    """城市标准化：先按城市名匹配，未命中再按县级映射到城市。
+
+    对应 else_sync 原 _extract_city。distr/distr_all 是小表，collect 到 driver
+    构造正则（与 pandas 版一致的「整列正则匹配」语义）。
+    """
+    cities = [r["city"] for r in distr.select("city").distinct().collect() if r["city"]]
+    county_rows = distr_all.select("key_county", "city").distinct().collect()
+    counties = [r["key_county"] for r in county_rows if r["key_county"]]
+    county_to_city = {r["key_county"]: r["city"] for r in county_rows if r["key_county"]}
+
+    col = F.col(src_col)
+    city_hit = _city_extract_expr(col, cities)
+
+    # 县级回退：未命中城市时，从县名映射回城市
+    county_pat = "|".join(re.escape(c) for c in counties)
+    county_ext = F.regexp_extract(col.cast("string"), f"({county_pat})", 1)
+    # 用 map 把县名翻成城市
+    mapping = F.create_map([F.lit(x) for kv in county_to_city.items() for x in kv]) if county_to_city else None
+    county_city = mapping[county_ext] if mapping is not None else F.lit(None)
+
+    result = F.when(city_hit.isNotNull(), city_hit).otherwise(
+        F.when(county_ext != "", county_city).otherwise(None)
+    )
+    return sdf.withColumn(src_col, result)
+
+
 # ── 1. 投诉数据（每月 1 日） ────────────────────────────────────────
 
 def sync_complaint() -> None:
     month_ago = str(_TODAY - timedelta(days=31))
-
     tables = {
         "spider_complain_12365auto": f"SELECT * FROM spider_complain_12365auto WHERE add_time > '{month_ago}'",
         "spider_complain_315qc": f"""SELECT id,series,brand,question,complain_time,
@@ -92,13 +109,13 @@ def sync_complaint() -> None:
                                         WHERE DATE_FORMAT(add_time,'%Y-%m-%d') > '{month_ago}'""",
     }
     for tbl, sql in tables.items():
-        df = db.query(DB_LOCAL, sql)
-        if not df.empty:
-            db.bulk_upsert(DB_YUN, tbl, df)
+        sdf = read_sql(DB_LOCAL, sql)
+        if len(sdf.head(1)):
+            write_replace(DB_YUN, tbl, sdf)
 
     # 车主之家投诉（需城市清洗）
     distr, distr_all = _load_distr()
-    df = db.query(
+    sdf = read_sql(
         DB_LOCAL,
         f"""SELECT complain_id, series_id, city, tag1, des1, tag2, des2, tag3, des3,
                    tag4, des4, tag5, des5, tag6, des6,
@@ -107,15 +124,16 @@ def sync_complaint() -> None:
             FROM spider_complain_autoowner
             WHERE DATE_FORMAT(update_time,'%Y-%m-%d') > '{month_ago}'""",
     )
-    if not df.empty:
-        df["city"] = _extract_city(df["city"], distr, distr_all)
-        df = df.merge(distr[["city", "province"]], on="city", how="inner")
-        df = df[["complain_id", "series_id", "province", "city",
-                  "tag1", "des1", "tag2", "des2", "tag3", "des3",
-                  "tag4", "des4", "tag5", "des5", "tag6", "des6",
-                  "complain_time", "update_time"]]
-        db.bulk_upsert(DB_YUN, "spider_complain_autoowner", df)
-
+    if len(sdf.head(1)):
+        sdf = _add_city_clean(sdf, "city", distr, distr_all)
+        sdf = sdf.join(distr.select("city", "province").distinct(), on="city", how="inner")
+        sdf = sdf.select(
+            "complain_id", "series_id", "province", "city",
+            "tag1", "des1", "tag2", "des2", "tag3", "des3",
+            "tag4", "des4", "tag5", "des5", "tag6", "des6",
+            "complain_time", "update_time",
+        )
+        write_replace(DB_YUN, "spider_complain_autoowner", sdf)
     print("[else_sync] 投诉数据同步完成")
 
 
@@ -123,9 +141,9 @@ def sync_complaint() -> None:
 
 def sync_discount() -> None:
     stat_time = _TODAY.strftime("%Y-%m-15")
-    df = db.query(DB_LOCAL, f"SELECT * FROM discount_rate_history WHERE stat_time = '{stat_time}'")
-    if not df.empty:
-        db.bulk_upsert(DB_YUN, "discount_rate_history", df)
+    sdf = read_sql(DB_LOCAL, f"SELECT * FROM discount_rate_history WHERE stat_time = '{stat_time}'")
+    if len(sdf.head(1)):
+        write_replace(DB_YUN, "discount_rate_history", sdf)
         notifier.send_mail("数据同步-其它部分", "经销商报价 discount_rate_history 更新完毕")
     print("[else_sync] 经销商报价同步完成")
 
@@ -134,34 +152,36 @@ def sync_discount() -> None:
 
 def sync_salesnum() -> None:
     # 搜狐
-    df_souhu = db.query(
-        DB_LOCAL,
-        f"SELECT * FROM spider_salesnum_souhu WHERE add_time > '{_MONTH_START}'",
-    )
-    if not df_souhu.empty:
-        db.bulk_upsert(DB_YUN, "spider_salesnum_souhu", df_souhu)
+    df_souhu = read_sql(DB_LOCAL, f"SELECT * FROM spider_salesnum_souhu WHERE add_time > '{_MONTH_START}'")
+    if len(df_souhu.head(1)):
+        write_replace(DB_YUN, "spider_salesnum_souhu", df_souhu)
 
     # 车主之家
     month_ago = str(_TODAY - timedelta(days=31))
-    df_ao = db.query(
+    df_ao = read_sql(
         DB_LOCAL,
         f"""SELECT series_id, stat_date, salesNum, update_time add_time
             FROM spider_salesnum_autoowner
             WHERE update_time > '{month_ago}'""",
     )
-    if not df_ao.empty:
-        series_brand = db.query(
+    if len(df_ao.head(1)):
+        series_brand = read_sql(
             DB_LOCAL,
             "SELECT DISTINCT series_id, series_name, brand_id, brand_name FROM config_autoowner_major_info_tmp",
         )
-        series_brand["series_id"] = pd.to_numeric(series_brand["series_id"], errors="coerce")
-        series_brand["brand_id"] = pd.to_numeric(series_brand["brand_id"], errors="coerce")
-        df_ao["stat_date"] = pd.to_datetime(df_ao["stat_date"].astype(str) + "-01", errors="coerce")
-        df_ao["series_id"] = pd.to_numeric(df_ao["series_id"], errors="coerce")
-        df_ao = df_ao.merge(series_brand, on="series_id", how="inner")
-        df_ao = df_ao[["brand_id", "brand_name", "series_id", "series_name", "stat_date", "salesNum", "add_time"]]
-        db.bulk_upsert(DB_YUN, "spider_salesnum_autoowner", df_ao)
-
+        series_brand = (
+            series_brand
+            .withColumn("series_id", F.col("series_id").cast("long"))
+            .withColumn("brand_id", F.col("brand_id").cast("long"))
+        )
+        df_ao = (
+            df_ao
+            .withColumn("stat_date", F.to_date(F.concat(F.col("stat_date").cast("string"), F.lit("-01"))))
+            .withColumn("series_id", F.col("series_id").cast("long"))
+            .join(series_brand, on="series_id", how="inner")
+            .select("brand_id", "brand_name", "series_id", "series_name", "stat_date", "salesNum", "add_time")
+        )
+        write_replace(DB_YUN, "spider_salesnum_autoowner", df_ao)
     print("[else_sync] 销量数据同步完成")
 
 
@@ -169,7 +189,7 @@ def sync_salesnum() -> None:
 
 def sync_koubei() -> None:
     since = (_TODAY - timedelta(days=5)).strftime("%Y-%m-01")
-    df = db.query(
+    sdf = read_sql(
         DB_LOCAL,
         f"""SELECT id, eid, model_id, isbattery,
                    IF(drivenKilometers_appends>=drivekilometer, drivenKilometers_appends, drivekilometer) miles,
@@ -186,43 +206,41 @@ def sync_koubei() -> None:
             FROM spider_koubei_autohome
             WHERE DATE_FORMAT(add_time,'%Y-%m-%d') > '{since}'""",
     )
-    if df.empty:
+    if len(sdf.head(1)) == 0:
         print("[else_sync] 口碑：无新数据")
         return
 
-    model_info = db.query(
+    model_info = read_sql(
         DB_LOCAL,
         "SELECT model_id, model_name, brand_id, brand_name, series_id, series_name, model_year, model_price FROM config_autohome_major_info_tmp",
-    )
-    district_code = db.query(
+    ).withColumn("model_id", F.col("model_id").cast("long"))
+    district_code = read_sql(
         DB_LOCAL,
         """SELECT SUBSTR(city_code,1,2) province_id, SUBSTR(city_code,1,4) city_id,
                   key_province province, MIN(key_municipal) city
            FROM config_district
            GROUP BY SUBSTR(city_code,1,4), key_province""",
     )
-    model_info["model_id"] = pd.to_numeric(model_info["model_id"], errors="coerce")
-    df["model_id"] = pd.to_numeric(df["model_id"], errors="coerce")
+    prov_map = district_code.select("province_id", "province").distinct()
+    city_map = district_code.select("city_id", "city").distinct()
 
-    prov_map = district_code[["province_id", "province"]].drop_duplicates()
-    city_map = district_code[["city_id", "city"]].drop_duplicates()
-
-    df = (
-        df.merge(model_info, on="model_id", how="inner")
-          .merge(prov_map, on="province_id", how="inner")
-          .merge(city_map, on="city_id", how="left")
+    sdf = (
+        sdf.withColumn("model_id", F.col("model_id").cast("long"))
+        .join(model_info, on="model_id", how="inner")
+        .join(prov_map, on="province_id", how="inner")
+        .join(city_map, on="city_id", how="left")
     )
-    df["boughtdate"] = (df["boughtdate"].astype(str) + "-01").apply(
-        lambda s: pd.to_datetime(s, errors="coerce")
+    sdf = sdf.withColumn("boughtdate", F.to_date(F.concat(F.col("boughtdate").cast("string"), F.lit("-01"))))
+    sdf = sdf.select(
+        "id", "eid", "model_id", "brand_id", "brand_name", "series_id", "series_name",
+        "model_year", "model_name", "model_price", "isbattery",
+        "boughtdate", "boughtPrice", "province", "city", "miles",
+        "visitcount", "helpfulcount", "commentcount",
+        "space", "power", "control", "oilconsumption", "eleconsumption",
+        "comfortableness", "apperance", "interior", "costefficient",
+        "satisfaction", "comment_time", "add_time",
     )
-    df = df[["id", "eid", "model_id", "brand_id", "brand_name", "series_id", "series_name",
-             "model_year", "model_name", "model_price", "isbattery",
-             "boughtdate", "boughtPrice", "province", "city", "miles",
-             "visitcount", "helpfulcount", "commentcount",
-             "space", "power", "control", "oilconsumption", "eleconsumption",
-             "comfortableness", "apperance", "interior", "costefficient",
-             "satisfaction", "comment_time", "add_time"]]
-    db.bulk_upsert(DB_YUN, "spider_koubei_autohome", df)
+    write_replace(DB_YUN, "spider_koubei_autohome", sdf)
     print("[else_sync] 口碑数据同步完成")
 
 
@@ -245,11 +263,11 @@ def sync_dealer() -> None:
                                        WHERE DATE_FORMAT(update_time,'%Y-%m-%d') > '{since}'""",
     }
     for tbl, sql in dealer_tables.items():
-        df = db.query(DB_LOCAL, sql)
-        if tbl == "spider_dealer_ownerhome" and not df.empty:
-            df["city_name"] = df["city_name"].str.replace("市", "", regex=False)
-        if not df.empty:
-            db.bulk_upsert(DB_YUN, tbl, df)
+        sdf = read_sql(DB_LOCAL, sql)
+        if tbl == "spider_dealer_ownerhome" and len(sdf.head(1)):
+            sdf = sdf.withColumn("city_name", F.regexp_replace(F.col("city_name"), "市", ""))
+        if len(sdf.head(1)):
+            write_replace(DB_YUN, tbl, sdf)
             notifier.send_mail("数据同步-其它部分", f"经销商 {tbl} 更新完毕")
     print("[else_sync] 经销商信息同步完成")
 
@@ -258,7 +276,7 @@ def sync_dealer() -> None:
 
 def sync_owner_price_autohome() -> None:
     since = (_TODAY - timedelta(days=5)).strftime("%Y-%m-01")
-    df = db.query(
+    sdf = read_sql(
         DB_LOCAL,
         f"""SELECT id, model_id, series_id, series_name, model_name,
                    boughtaddress city, boughtdate, owner_price_id owner_id,
@@ -267,30 +285,35 @@ def sync_owner_price_autohome() -> None:
             FROM spider_ownerprice_autohome
             WHERE DATE_FORMAT(add_time,'%Y-%m-%d') > '{since}'""",
     )
-    if df.empty:
+    if len(sdf.head(1)) == 0:
         print("[else_sync] 汽车之家裸车价：无新数据")
         return
 
     distr, distr_all = _load_distr()
-    df["city_clean"] = _extract_city(df["city"], distr, distr_all)
-    df["province"] = _extract_city(df["city"], distr.rename(columns={"city": "province"})[["province"]], distr_all)
+    provinces = [r["province"] for r in distr.select("province").distinct().collect() if r["province"]]
+    prov_pat = "|".join(re.escape(p) for p in provinces)
 
-    # 省份单独提取
-    prov_pat = "|".join(re.escape(p) for p in distr["province"].unique())
-    df["province"] = df["city"].str.extract(f"({prov_pat})")[0]
+    # 省份：从原始 city 文本提取
+    sdf = sdf.withColumn("province", F.regexp_extract(F.col("city").cast("string"), f"({prov_pat})", 1))
+    sdf = sdf.withColumn("province", F.when(F.col("province") == "", None).otherwise(F.col("province")))
+    # 城市标准化（覆盖 city 列）
+    sdf = _add_city_clean(sdf, "city", distr, distr_all)
+    sdf = sdf.withColumn("boughtdate", F.to_date(F.col("boughtdate")))
 
-    df["city"] = df["city_clean"]
-    df = df.drop(columns=["city_clean"])
-    df["boughtdate"] = pd.to_datetime(df["boughtdate"], errors="coerce")
-    df = df[
-        (df["model_price"] != 0) & (df["bare_price"] != 0) &
-        ((df["model_price"] - df["bare_price"]).abs() / df["bare_price"] <= 3) &
-        ((df["model_price"] - df["bare_price"]).abs() / df["model_price"] <= 2)
-    ]
-    df = df[["id", "model_id", "series_id", "series_name", "model_name", "model_price",
-             "province", "city", "boughtdate", "owner_id", "bare_price", "fullprice",
-             "purchase_tax", "commercial_insure", "vehicle_tax", "high_insure", "card_fee", "add_time"]]
-    db.bulk_upsert(DB_YUN, "spider_ownerprice_autohome", df)
+    # 价格合理性过滤（与 pandas 版一致）
+    mp = F.col("model_price").cast("double")
+    bp = F.col("bare_price").cast("double")
+    sdf = sdf.filter(
+        (mp != 0) & (bp != 0)
+        & (F.abs(mp - bp) / bp <= 3)
+        & (F.abs(mp - bp) / mp <= 2)
+    )
+    sdf = sdf.select(
+        "id", "model_id", "series_id", "series_name", "model_name", "model_price",
+        "province", "city", "boughtdate", "owner_id", "bare_price", "fullprice",
+        "purchase_tax", "commercial_insure", "vehicle_tax", "high_insure", "card_fee", "add_time",
+    )
+    write_replace(DB_YUN, "spider_ownerprice_autohome", sdf)
     print("[else_sync] 汽车之家裸车价同步完成")
 
 
@@ -298,7 +321,7 @@ def sync_owner_price_autohome() -> None:
 
 def sync_owner_price_yiche() -> None:
     since = (_TODAY - timedelta(days=8)).strftime("%Y-%m-20")
-    df = db.query(
+    sdf = read_sql(
         DB_LOCAL,
         f"""SELECT id, brand_name, series_name, model_name, buy_time, city,
                    ROUND(guidance_price/10000, 2) model_price,
@@ -306,28 +329,33 @@ def sync_owner_price_yiche() -> None:
             FROM spider_nakedprice_yiche
             WHERE DATE_FORMAT(add_time,'%Y-%m-%d') > '{since}'""",
     )
-    if df.empty:
+    if len(sdf.head(1)) == 0:
         print("[else_sync] 易车裸车价：无新数据")
         return
 
     distr, distr_all = _load_distr()
-    df["city_clean"] = _extract_city(df["city"], distr, distr_all)
-    df = df.merge(distr[["city", "province"]], left_on="city_clean", right_on="city", how="inner").drop(columns=["city_x", "city_y"])
-    df = df.rename(columns={"city_clean": "city"})
-    df["buy_time"] = pd.to_datetime(df["buy_time"], errors="coerce")
-    df["model_year"] = df["model_name"].str.extract(r"([12]\d{3})款|(\d{2})款")[0].fillna(
-        df["model_name"].str.extract(r"([12]\d{3})款|(\d{2})款")[1]
-    ).str.replace("款", "", regex=False)
-    df["brand_name"] = df["brand_name"].str.upper()
-    df["series_name"] = df["series_name"].str.upper()
-    df = df[
-        (df["model_price"] != 0) & (df["bare_price"] != 0) &
-        ((df["model_price"] - df["bare_price"]).abs() / df["bare_price"] <= 3) &
-        ((df["model_price"] - df["bare_price"]).abs() / df["model_price"] <= 2)
-    ]
-    df = df[["id", "brand_name", "series_name", "model_year", "model_name",
-             "model_price", "province", "city", "buy_time", "bare_price", "add_time"]]
-    db.bulk_upsert(DB_YUN, "spider_nakedprice_yiche", df)
+    sdf = _add_city_clean(sdf, "city", distr, distr_all)
+    sdf = sdf.join(distr.select("city", "province").distinct(), on="city", how="inner")
+    sdf = sdf.withColumn("buy_time", F.to_date(F.col("buy_time")))
+    # 年款：从 model_name 提取 4 位或 2 位年款
+    yr4 = F.regexp_extract(F.col("model_name"), r"([12]\d{3})款", 1)
+    yr2 = F.regexp_extract(F.col("model_name"), r"(\d{2})款", 1)
+    sdf = sdf.withColumn("model_year", F.when(yr4 != "", yr4).otherwise(yr2))
+    sdf = sdf.withColumn("brand_name", F.upper(F.col("brand_name")))
+    sdf = sdf.withColumn("series_name", F.upper(F.col("series_name")))
+
+    mp = F.col("model_price").cast("double")
+    bp = F.col("bare_price").cast("double")
+    sdf = sdf.filter(
+        (mp != 0) & (bp != 0)
+        & (F.abs(mp - bp) / bp <= 3)
+        & (F.abs(mp - bp) / mp <= 2)
+    )
+    sdf = sdf.select(
+        "id", "brand_name", "series_name", "model_year", "model_name",
+        "model_price", "province", "city", "buy_time", "bare_price", "add_time",
+    )
+    write_replace(DB_YUN, "spider_nakedprice_yiche", sdf)
     print("[else_sync] 易车裸车价同步完成")
 
 
@@ -343,7 +371,6 @@ _TASK_MAP = {
     "owner_price_yiche": sync_owner_price_yiche,
 }
 
-# 按日期自动判断哪些任务需要执行
 _SCHEDULE: dict[str, list[str]] = {
     "day_1":    ["complaint", "koubei", "dealer"],
     "day_28":   ["discount", "salesnum"],
@@ -353,6 +380,7 @@ _SCHEDULE: dict[str, list[str]] = {
 
 
 def run(task: str | None = None) -> None:
+    get_spark()  # 触发 SparkSession 初始化
     if task:
         tasks = [task]
     else:
@@ -377,7 +405,7 @@ def run(task: str | None = None) -> None:
             continue
         try:
             fn()
-        except Exception as e:
+        except Exception:
             import traceback
             notifier.send_mail(f"数据同步-其它部分 {t} 异常", traceback.format_exc())
 
