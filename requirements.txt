@@ -2,5 +2,7 @@
 pandas==3.0.3
 numpy==2.4.6
 PyMySQL==1.2.0
+SQLAlchemy>=2.0
+pyspark>=3.5
 pypinyin==0.55.0
 python-dotenv==1.2.2
