@@ -71,6 +71,21 @@ _LEVEL_OK = {
     "无", "-", "",  # 无值表示
 }
 
+# 「主/副/前/后标配」等配置标志位专属值。这些只应出现在配置标志位字段，
+# 若出现在基础参数/发动机/底盘等文本字段 = 配置字段错位进来。
+_FLAG_LEAK = re.compile(r"[主副前后]?标配|[主副前后]?选配|[主副前后]无(?![级])")
+
+# 基础/发动机/底盘文本字段（表结构 master_air_bag 之前的非标志位字段）：
+# 都不应含配置标志位专属值（主/副标配等）。数值字段另有范围校验，这里补文本类。
+_BASE_TEXT_COLS = [
+    "engine", "gear_box", "body_structure", "intake", "cylinder_arrangement",
+    "admission_gear", "fuel", "fuel_grade", "fuel_supply_system",
+    "environmental_standards_org", "drive_mode",
+    "front_suspension_type", "rear_suspension_type", "power_type", "car_boty_type",
+    "front_brake_type", "rear_brake_type", "parking_brake_type",
+    "front_tire_specifications", "rear_tire_specifications",
+]
+
 # ── 数值字段三层范围：(正常min, 正常max, 商用车max)。超商用车max或非数字=ERROR ──
 #   在 [正常max, 商用车max] 之间 = WARN（商用车/客车），(0,正常min) 也 WARN
 NUM_RANGE = {
@@ -110,6 +125,13 @@ class Report:
 
     def error_ids(self) -> list:
         return sorted({aid for _, aid, _, _ in self.errors})
+
+    def dirty_reason_by_idx(self) -> dict:
+        """脏行的 DataFrame 索引 → 该行所有错位原因汇总（分号连接）。"""
+        out: dict = {}
+        for idx, _aid, col, why in self.errors:
+            out.setdefault(idx, []).append(f"[{col}]{why}")
+        return {idx: "; ".join(reasons) for idx, reasons in out.items()}
 
 
 def _s(v) -> str:
@@ -186,8 +208,14 @@ def validate_car_config(df: pd.DataFrame) -> tuple[pd.DataFrame, Report]:
             err(idx, aid, "fuel", f"混入制动词（错位）: {row.get('fuel')!r}")
         if "environmental_standards" in df.columns and _DRIVE_WORDS.search(_s(row.get("environmental_standards"))):
             err(idx, aid, "environmental_standards", f"混入驱动词（错位）: {row.get('environmental_standards')!r}")
-        if "front_tire_specifications" in df.columns and _CONFIG_WORDS.search(_s(row.get("front_tire_specifications"))):
-            warn(idx, aid, "front_tire_specifications", f"含配置词（疑错位）: {row.get('front_tire_specifications')!r}")
+        # 通用判据：基础/发动机/底盘文本字段含「主副前后标配」等配置标志位专属值
+        # = 配置字段错位进来（如 fuel='主标配/副标配'、engine='前标配/后-'）
+        for col in _BASE_TEXT_COLS:
+            if col not in df.columns:
+                continue
+            val = _s(row.get(col))
+            if val and _FLAG_LEAK.search(val):
+                err(idx, aid, col, f"混入配置标志位值（错位）: {val!r}")
 
         # level：车型等级，只能是中文等级枚举或无值；数字/其它=错位
         if "level" in df.columns:
@@ -230,3 +258,35 @@ def validate_car_config(df: pd.DataFrame) -> tuple[pd.DataFrame, Report]:
     rep.kept = rep.total - rep.dropped
     clean = df.drop(index=list(bad_rows)) if bad_rows else df
     return clean, rep
+
+
+def save_dirty_rows(cfg: dict, orig_df: pd.DataFrame, rep: Report,
+                    target_table: str = "yck_car_basic_config") -> int:
+    """把校验判为脏的行（连同错位原因、时间）落入 <target_table>_dirty 表。
+
+    dirty 表结构 = 目标表 + `_dirty_reason`(错位原因) + `_scan_time`(写入时间)。
+    表不存在则自动按目标表结构创建。返回落入行数。
+    """
+    from datetime import datetime
+
+    reason_map = rep.dirty_reason_by_idx()
+    if not reason_map:
+        return 0
+    dirty = orig_df.loc[list(reason_map.keys())].copy()
+    dirty["_dirty_reason"] = [reason_map[i] for i in dirty.index]
+    dirty["_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    dirty_table = f"{target_table}_dirty"
+    # 建表（LIKE 目标表 + 追加两列）；已存在则忽略
+    from common import db
+    db.execute(cfg, f"CREATE TABLE IF NOT EXISTS `{dirty_table}` LIKE `{target_table}`")
+    for col, ddl in (("_dirty_reason", "TEXT"), ("_scan_time", "VARCHAR(20)")):
+        try:
+            db.execute(cfg, f"ALTER TABLE `{dirty_table}` ADD COLUMN `{col}` {ddl}")
+        except Exception:
+            pass  # 列已存在
+    # dirty 表沿用目标表的自增主键 id 会冲突，写入时不带 id（让其自增）
+    if "id" in dirty.columns:
+        dirty = dirty.drop(columns=["id"])
+    db.bulk_insert(cfg, dirty_table, dirty)
+    return len(dirty)
