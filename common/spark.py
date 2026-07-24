@@ -57,7 +57,12 @@ def get_spark(app_name: str = "yck_wash_model") -> SparkSession:
             "spark.jars.packages",
             os.environ.get("MYSQL_JDBC_PACKAGE", "com.mysql:mysql-connector-j:8.3.0"),
         )
-    return builder.getOrCreate()
+    spark = builder.getOrCreate()
+    # 压掉海量 INFO 日志，让业务日志清晰可见（可用 SPARK_LOG_LEVEL 覆盖）。
+    # 注：退出时 ShutdownHookManager 删临时 jar 失败的 ERROR 属 JVM 层告警，
+    # 不归 Spark logger 管，无法在此压制，且无害。
+    spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
+    return spark
 
 
 # ── JDBC 连接属性 ──────────────────────────────────────────────────────
