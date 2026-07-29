@@ -25,7 +25,7 @@
   python tools/resync_autohome_by_ids.py --ids 12345 --dry-run --out-file resync.log
 
   # 把最终待写入 IT 的宽表导出 CSV 供核对（不写库）
-  python tools/resync_autohome_by_ids.py --ids 12345 --dry-run --dump-csv tools/preview.csv
+  python tools/resync_autohome_by_ids.py --id-file tools/ids.txt --dry-run --dump-csv tools/preview.csv
 
   # 正式写入（REPLACE 覆盖到 DB_IT）
   python tools/resync_autohome_by_ids.py --ids 12345,67890 --commit

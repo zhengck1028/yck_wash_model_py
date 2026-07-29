@@ -55,6 +55,9 @@ FLAG_COLS = [
 ]
 _FLAG_OK = {"Y", "N", "-", ""}
 
+# 统一的「无值/空值」表示：这些都是合法的「该项无数据」，不是错位
+_EMPTY = {"", "-", "无"}
+
 # 错位污染特征词（出现在标志位/相邻字段=错位）
 _SUSPENSION_WORDS = re.compile(r"多连杆|承载式|双横臂|麦弗逊|扭力梁|悬架|独立悬")
 _BRAKE_WORDS = re.compile(r"通风盘式|盘式|鼓式")
@@ -63,12 +66,12 @@ _CONFIG_WORDS = re.compile(r"标配|选配|驻车")
 # 配置标志位/进气等错位进 engine 的特征（engine 正常含「马力/电动/kW」）
 _ENGINE_DIRTY = re.compile(r"标配|选配|^[YN]$|^\d+$|直喷|多点电喷|混合喷射")
 
-# level（车型等级）合法枚举：中文等级词 + 无值表示
+# level（车型等级）合法枚举：精确匹配已知等级词或无值。
+# 非标准值（如「低端皮卡」「紧凑型SU」截断、数字 1）一律判脏、走人工处理。
 _LEVEL_OK = {
     "紧凑型SUV", "中型SUV", "紧凑型车", "中大型车", "中型车", "中大型SUV", "大型SUV",
     "大型车", "微型车", "小型车", "MPV", "跑车", "小型SUV", "微面", "皮卡", "微卡",
     "轻客", "客车", "紧凑型MPV", "卡车", "中大型MPV", "货车", "重卡",
-    "无", "-", "",  # 无值表示
 }
 
 # 「主/副/前/后标配」等配置标志位专属值。这些只应出现在配置标志位字段，
@@ -198,7 +201,7 @@ def validate_car_config(df: pd.DataFrame) -> tuple[pd.DataFrame, Report]:
                 err(idx, aid, col, f"非 Y/N/- 值: {val!r}")
 
         # 5) 错位特征字段
-        if "length" in df.columns and re.search(r"[^\d.]", _s(row.get("length"))) and _s(row.get("length")) not in ("", "-"):
+        if "length" in df.columns and _s(row.get("length")) not in _EMPTY and re.search(r"[^\d.]", _s(row.get("length"))):
             err(idx, aid, "length", f"含非数字（变速箱/发动机错位）: {_s(row.get('length'))!r}")
         if "emission" in df.columns and re.fullmatch(r"\d{4}", _s(row.get("emission"))):
             err(idx, aid, "emission", f"纯4位数（车长错位）: {row.get('emission')!r}")
@@ -217,11 +220,11 @@ def validate_car_config(df: pd.DataFrame) -> tuple[pd.DataFrame, Report]:
             if val and _FLAG_LEAK.search(val):
                 err(idx, aid, col, f"混入配置标志位值（错位）: {val!r}")
 
-        # level：车型等级，只能是中文等级枚举或无值；数字/其它=错位
+        # level：车型等级，精确匹配已知等级枚举或无值；否则=错位（人工处理）
         if "level" in df.columns:
             lv = _s(row.get("level"))
-            if lv not in _LEVEL_OK:
-                err(idx, aid, "level", f"非法车型等级（应为等级词或无）: {lv!r}")
+            if lv not in _EMPTY and lv not in _LEVEL_OK:
+                err(idx, aid, "level", f"非标准车型等级（应为标准等级词或无）: {lv!r}")
 
         # engine：正常含「马力/电动/kW」；出现 标配/Y/N/纯数字/进气词 = 错位
         if "engine" in df.columns:
@@ -234,7 +237,7 @@ def validate_car_config(df: pd.DataFrame) -> tuple[pd.DataFrame, Report]:
             if col not in df.columns:
                 continue
             raw = _s(row.get(col))
-            if raw in ("", "-"):
+            if raw in _EMPTY:  # 无/空/- 都是合法无值
                 continue
             n = _num(raw)
             if n is None:  # 数值字段却非数字 = 错位

@@ -118,10 +118,25 @@ def _tmp_table_name(table: str) -> str:
 
 def _stage_to_tmp(cfg: dict, table: str, sdf: DataFrame) -> tuple[str, list[str]]:
     """把 sdf 写入与目标表同结构的临时表，返回 (临时表名, 列名列表)。"""
+    from pyspark.sql import functions as F
+
     tmp = _tmp_table_name(table)
     # 用目标表结构建临时表（含主键，供 ON DUPLICATE KEY 生效）
     db.execute(cfg, f"CREATE TABLE `{tmp}` LIKE `{table}`")
     cols = sdf.columns
+    # 目标表几乎全是 varchar。数值列（decimal/double 等）转成 string 写入。
+    # 关键：decimal 经 join 会精度膨胀（decimal(10,2) → decimal(38,18)），
+    # 直接 cast string 会得到 '29.000000000000000000'（21 字符）触发 Data too long。
+    # 故先把小数格式化、去掉尾随 0 和多余小数点，再写。
+    numeric_types = {"double", "float", "int", "bigint", "smallint", "tinyint"}
+    for name, dtype in sdf.dtypes:
+        if dtype.startswith("decimal") or dtype in numeric_types:
+            s = F.col(name).cast("string")
+            # 去掉小数部分尾随 0（29.000 → 29；29.500 → 29.5），整数不受影响
+            s = F.when(s.contains("."),
+                       F.regexp_replace(F.regexp_replace(s, r"0+$", ""), r"\.$", "")
+                       ).otherwise(s)
+            sdf = sdf.withColumn(name, s)
     # Spark JDBC append 写临时表
     sdf.write.jdbc(
         url=_jdbc_url(cfg), table=f"`{tmp}`", mode="append", properties=_jdbc_props(cfg)

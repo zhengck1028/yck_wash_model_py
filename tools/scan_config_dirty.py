@@ -86,8 +86,22 @@ def main() -> None:
         err_df = err_df.merge(pk, on="autohome_id", how="left")
         err_df = err_df[["autohome_id", "id", "brand", "series", "n_error_fields", "first_reason"]]
         err_df = err_df.sort_values("n_error_fields", ascending=False)
-        err_df.to_csv(OUT_DIR / "dirty_ids.csv", index=False, encoding="utf-8-sig")
-        pd.DataFrame(all_detail).to_csv(OUT_DIR / "dirty_detail.csv", index=False, encoding="utf-8-sig")
+
+        def _safe_csv(df_out, name):
+            """文件被占用（Excel/IDE 打开）时换带时间戳名，避免脚本崩。"""
+            from datetime import datetime
+            path = OUT_DIR / f"{name}.csv"
+            try:
+                df_out.to_csv(path, index=False, encoding="utf-8-sig")
+                return path
+            except PermissionError:
+                alt = OUT_DIR / f"{name}_{datetime.now():%H%M%S}.csv"
+                df_out.to_csv(alt, index=False, encoding="utf-8-sig")
+                log.warning(f"  {name}.csv 被占用，改存 {alt.name}")
+                return alt
+
+        _safe_csv(err_df, "dirty_ids")
+        _safe_csv(pd.DataFrame(all_detail), "dirty_detail")
 
     n_err_total = sum(1 for r in all_detail if r["level"] == "ERROR")
     n_warn_total = len(all_detail) - n_err_total
