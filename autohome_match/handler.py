@@ -154,20 +154,6 @@ def _sync_series() -> None:
         log.info("  → 无新车系")
 
 
-def _backfill_color() -> None:
-    """[3/7] 颜色回填（ODS 内部就地 UPDATE，走 SQL）。"""
-    log.info("[3/7] 颜色回填（ODS 内部）...")
-    n = db.execute(
-        DB_ODS,
-        """UPDATE config_autohome_detail_info a,
-           (SELECT b.model_id, c.color_outside, c.color_outside_code
-            FROM config_autohome_major_info_tmp b
-            INNER JOIN config_autohome_color c ON b.series_id = c.series_id
-            WHERE color_outside IS NOT NULL) b
-           SET a.color_outside = b.color_outside, a.color_outside_code = b.color_outside_code
-           WHERE a.autohome_id = b.model_id""",
-    )
-    log.info(f"  → 更新 {n} 条颜色记录")
 
 
 def _sync_config() -> None:
@@ -280,11 +266,32 @@ def _sync_config() -> None:
     # 只保留目标表真实存在的列（id 由 AUTO_INCREMENT，不写）
     target_cols = db.query(DB_IT, "DESCRIBE yck_car_basic_config")["Field"].tolist()
     keep_cols = [c for c in target_cols if c != "id" and c in yck.columns]
-    # 缺失列补 "-"（fillna 等价：写入前对 keep_cols 填充）
-    yck = yck.select(*keep_cols).fillna("-")
+    # 空值统一用空串：仍为 null 的列补 ""（配置标志位经清洗已是 Y/N/-，非 null，不受影响）
+    yck = yck.select(*keep_cols).fillna("")
+
+    # ── 写入前数据验证：脏行（错位/异常）另存 dirty 表，只把干净行写生产库 ──
+    from common.validation import validate_car_config, save_dirty_rows
+
+    pdf = yck.toPandas()
+    clean_pdf, rep = validate_car_config(pdf)
+    rep.log(log)
+    if rep.dropped:
+        saved = save_dirty_rows(DB_IT, pdf, rep, "yck_car_basic_config")
+        log.warning(f"  → {rep.dropped} 条脏数据已另存 yck_car_basic_config_dirty 表（未进生产库）")
+        notifier.send_mail(
+            "车型库同步-拦截脏数据",
+            f"本次同步拦截 {rep.dropped} 条错位/异常车型（已存 dirty 表待核查）。<br>"
+            f"涉及 autohome_id: {rep.error_ids()}",
+        )
+
+    if len(clean_pdf) == 0:
+        log.warning("  → 校验后无有效数据，跳过写入。")
+        return
+    yck = get_spark().createDataFrame(clean_pdf)
+
     n = yck.count()
     write_insert(DB_IT, "yck_car_basic_config", yck)
-    log.info(f"  → 写入 {n} 条车型记录")
+    log.info(f"  → 写入 {n} 条车型记录（已剔除脏数据）")
 
 
 def _update_prices() -> None:
@@ -352,7 +359,6 @@ def run() -> None:
     get_spark()  # 触发 SparkSession 初始化
     _sync_brand()
     _sync_series()
-    _backfill_color()
     _sync_config()
     _update_prices()
     _sync_ev()

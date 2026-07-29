@@ -23,6 +23,8 @@ _migration/
 *.sql.bak
 *.csv
 preview_*.csv
+# 工具产出的 id 清单/数据文件（如 ids.txt / dirty_autohome_ids.txt）
+tools/*.txt
 
 # ── 日志 ──
 *.log

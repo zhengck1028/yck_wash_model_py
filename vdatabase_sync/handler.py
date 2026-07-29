@@ -166,7 +166,48 @@ def _sync_ev(src_table: str) -> None:
     write_replace(DB_ODS, src_table, sdf)
 
 
+# ── 外观颜色专项同步 ──────────────────────────────────────────────────
+
+def _sync_color_from_detail() -> None:
+    """把爬虫库 detail 的颜色同步到 ODS detail（只更新 color 两列）。
+
+    颜色由专门的颜色爬虫填入爬虫库 config_autohome_detail_info.color_outside，
+    但该爬虫更新 color 时【不刷新 update_time】，所以常规增量（按 update_time）
+    抓不到颜色变更。这里专项同步：全量取爬虫库有颜色的行，跨库经 ODS 临时表
+    UPDATE JOIN 到 ODS detail 的 color 列（不动 detail 其他列，其他列由
+    _sync_detail_autohome 的增量负责）。既补历史存量、又持续同步以后的颜色。
+    """
+    sdf = read_sql(
+        DB_LOCAL,
+        """SELECT autohome_id, color_outside, color_outside_code
+           FROM config_autohome_detail_info
+           WHERE color_outside IS NOT NULL AND TRIM(color_outside) NOT IN ('', '-', '无')""",
+    )
+    if len(sdf.head(1)) == 0:
+        log.info("  颜色: 爬虫库无颜色数据，跳过。")
+        return
+    n = sdf.count()
+    tmp = "_color_sync_tmp"
+    db.execute(DB_ODS, f"DROP TABLE IF EXISTS {tmp}")
+    db.execute(
+        DB_ODS,
+        f"CREATE TABLE {tmp} (autohome_id BIGINT PRIMARY KEY, color_outside TEXT, color_outside_code TEXT)",
+    )
+    write_insert(DB_ODS, tmp, sdf)
+    # 跨库已落到同库临时表，UPDATE JOIN 就地更新 ODS detail 的 color 两列
+    updated = db.execute(
+        DB_ODS,
+        f"""UPDATE config_autohome_detail_info a
+            INNER JOIN {tmp} t ON a.autohome_id = t.autohome_id
+            SET a.color_outside = t.color_outside,
+                a.color_outside_code = t.color_outside_code""",
+    )
+    db.execute(DB_ODS, f"DROP TABLE IF EXISTS {tmp}")
+    log.info(f"  颜色: 爬虫库 {n} 条，更新 ODS detail {updated} 条颜色")
+
+
 # ── 2. 汽车之家详细配置同步 ──────────────────────────────────────────
+# detail 其他列按 update_time 增量同步；颜色由 _sync_color_from_detail 专项同步。
 
 def _sync_detail_autohome() -> None:
     sdf = read_sql(
@@ -320,7 +361,8 @@ def run() -> None:
     get_spark()
     log.info("[vdatabase_sync] 开始...")
     _sync_ev("config_autohome_ev_info")
-    _sync_detail_autohome()
+    _sync_detail_autohome()          # detail 其他列按 update_time 增量
+    _sync_color_from_detail()        # 颜色专项同步（不依赖 update_time），须在 detail 同步后
     _sync_autohome_major()
     notifier.send_mail("车型库源数据同步完成", f"完成时间：{__import__('datetime').datetime.now()}")
     log.info("[vdatabase_sync] 完成。")
